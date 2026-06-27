@@ -220,152 +220,294 @@ async def check_subscription_callback(update: Update, context: ContextTypes.DEFA
 
 # ─── Instagram Account Checker ───────────────────────────────────────────────
 
+def extract_ig_username(text: str) -> str:
+    text = text.strip()
+    # رابط إنستغرام — استخراج اسم المستخدم
+    patterns = [
+        r"instagram\.com/([A-Za-z0-9_.]+)/?$",
+        r"instagram\.com/([A-Za-z0-9_.]+)/?\?",
+        r"instagr\.am/([A-Za-z0-9_.]+)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            username = m.group(1)
+            # تجاهل مسارات خاصة
+            if username.lower() not in ("p", "reel", "stories", "explore", "accounts", "tv"):
+                return username.lower()
+    # اسم مستخدم مباشر أو @username
+    clean = text.lstrip("@").split("?")[0].rstrip("/")
+    if re.match(r'^[A-Za-z0-9_.]{1,30}$', clean):
+        return clean.lower()
+    return ""
+
+
 async def ig_check_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     context.user_data["mode"] = "ig_check"
     await query.message.reply_text(
         "📊 <b>فحص حساب إنستغرام</b>\n\n"
-        "أرسل لي اسم المستخدم (username) للحساب الذي تريد فحصه:\n\n"
-        "مثال: <code>cristiano</code>",
+        "أرسل رابط الحساب أو اسم المستخدم:\n\n"
+        "✅ <code>https://www.instagram.com/cristiano/</code>\n"
+        "✅ <code>cristiano</code>\n"
+        "✅ <code>@cristiano</code>",
         parse_mode="HTML",
     )
 
 
 async def check_instagram_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    username = update.message.text.strip().lstrip("@").lower()
-    status_msg = await update.message.reply_text(f"🔍 جاري فحص حساب @{username} ...")
+    raw = update.message.text.strip()
+    username = extract_ig_username(raw)
     context.user_data["mode"] = None
 
+    if not username:
+        await update.message.reply_text(
+            "❌ تعذّر استخراج اسم المستخدم.\n\n"
+            "أرسل رابط الحساب مثل:\n"
+            "<code>https://www.instagram.com/cristiano/</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    status_msg = await update.message.reply_text(f"🔍 جاري فحص حساب @{username} ...")
+
     headers = {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15",
-        "Accept": "application/json",
+        "User-Agent": (
+            "Mozilla/5.0 (Linux; Android 12; SM-G991B) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Mobile Safari/537.36 Instagram/313.0.0.0"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "ar,en;q=0.9",
         "x-ig-app-id": "936619743392459",
+        "x-requested-with": "XMLHttpRequest",
+        "Referer": f"https://www.instagram.com/{username}/",
     }
 
     try:
         async with aiohttp.ClientSession() as session:
-            url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
-            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            # المصدر الأول: web_profile_info
+            api_url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
+            async with session.get(api_url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                raw_text = await resp.text()
+
                 if resp.status == 404:
                     await status_msg.edit_text(
-                        f"❌ <b>الحساب غير موجود</b>\n\n"
-                        f"لم يتم العثور على حساب باسم @{username}",
+                        f"❌ <b>الحساب غير موجود أو محذوف</b>\n\n@{username}",
                         parse_mode="HTML",
+                    )
+                    return
+
+                if resp.status == 401 or resp.status == 403:
+                    await status_msg.edit_text(
+                        f"🔒 <b>الحساب خاص أو مقيّد</b>\n\n"
+                        f"@{username} لا يسمح بالوصول العام للبيانات.\n\n"
+                        f"🔗 <a href='https://www.instagram.com/{username}/'>افتح الحساب مباشرة</a>",
+                        parse_mode="HTML",
+                        disable_web_page_preview=False,
                     )
                     return
 
                 if resp.status != 200:
                     raise Exception(f"HTTP {resp.status}")
 
-                data = await resp.json()
+                try:
+                    data = json.loads(raw_text)
+                except Exception:
+                    raise Exception("فشل تحليل البيانات")
+
                 user = data.get("data", {}).get("user", {})
 
                 if not user:
                     await status_msg.edit_text(
-                        f"⚠️ <b>تعذّر الوصول للبيانات</b>\n\n"
-                        f"قد يكون الحساب خاصاً جداً أو محظوراً.",
+                        f"⚠️ <b>لا توجد بيانات كافية</b>\n\n"
+                        f"إنستغرام لم يُرجع بيانات للحساب @{username}.\n"
+                        f"قد يكون الحساب محظوراً أو خاصاً جداً.",
                         parse_mode="HTML",
                     )
                     return
 
-                full_name = user.get("full_name", "—")
-                followers = user.get("edge_followed_by", {}).get("count", 0)
-                following = user.get("edge_follow", {}).get("count", 0)
-                posts = user.get("edge_owner_to_timeline_media", {}).get("count", 0)
-                is_private = user.get("is_private", False)
-                is_verified = user.get("is_verified", False)
-                is_business = user.get("is_business_account", False)
-                bio = user.get("biography", "")
-                blocked_by_viewer = user.get("blocked_by_viewer", False)
-                has_profile_pic = user.get("has_public_story", False)
+        # ── استخراج البيانات ───────────────────────────────────────
+        full_name      = user.get("full_name") or "—"
+        followers      = user.get("edge_followed_by", {}).get("count", 0)
+        following      = user.get("edge_follow", {}).get("count", 0)
+        posts          = user.get("edge_owner_to_timeline_media", {}).get("count", 0)
+        is_private     = user.get("is_private", False)
+        is_verified    = user.get("is_verified", False)
+        is_business    = user.get("is_business_account", False)
+        is_professional= user.get("is_professional_account", False)
+        bio            = user.get("biography", "") or ""
+        external_url   = user.get("external_url") or ""
+        category       = user.get("category_name") or ""
+        profile_pic    = user.get("profile_pic_url_hd") or user.get("profile_pic_url") or ""
+        highlight_reel = user.get("highlight_reel_count", 0)
+        igtv_count     = user.get("edge_felix_video_timeline", {}).get("count", 0)
+        blocked        = user.get("blocked_by_viewer", False)
+        restricted     = user.get("restricted_by_viewer", False)
 
-                # تقييم صحة الحساب
-                score = 100
-                risks = []
-                goods = []
+        # ── تقييم الصحة ───────────────────────────────────────────
+        score = 100
+        risks = []
+        goods = []
 
-                if posts == 0:
-                    score -= 30
-                    risks.append("⚠️ لا يوجد منشورات")
-                else:
-                    goods.append(f"✅ {posts} منشور")
+        # المنشورات
+        if posts == 0:
+            score -= 35
+            risks.append("🚫 لا يوجد أي منشور — خطر حظر مرتفع")
+        elif posts < 5:
+            score -= 15
+            risks.append(f"⚠️ عدد المنشورات قليل جداً ({posts})")
+        elif posts < 20:
+            score -= 5
+            goods.append(f"✅ {posts} منشور (معقول)")
+        else:
+            goods.append(f"✅ {posts} منشور (نشاط جيد)")
 
-                if followers == 0:
-                    score -= 20
-                    risks.append("⚠️ صفر متابعين")
-                elif followers < 10:
-                    score -= 10
-                    risks.append("⚠️ متابعون قليلون جداً")
-                else:
-                    goods.append(f"✅ {followers:,} متابع")
+        # المتابعون
+        if followers == 0:
+            score -= 25
+            risks.append("🚫 صفر متابعين")
+        elif followers < 10:
+            score -= 15
+            risks.append(f"⚠️ متابعون قليلون جداً ({followers})")
+        elif followers < 100:
+            score -= 5
+            goods.append(f"✅ {followers:,} متابع")
+        else:
+            goods.append(f"✅ {followers:,} متابع")
 
-                if following > 0 and followers > 0:
-                    ratio = following / max(followers, 1)
-                    if ratio > 10:
-                        score -= 20
-                        risks.append("⚠️ نسبة المتابَعين/المتابِعين مرتفعة جداً")
+        # نسبة المتابعين/المتابَعين
+        if following > 0 and followers >= 0:
+            ratio = following / max(followers, 1)
+            if ratio > 20:
+                score -= 25
+                risks.append(f"🚫 نسبة متابَعين/متابعين خطرة ({following:,}/{max(followers,1):,})")
+            elif ratio > 5:
+                score -= 10
+                risks.append(f"⚠️ نسبة متابَعين مرتفعة ({following:,} تتابع / {followers:,} يتابعك)")
+            else:
+                goods.append(f"✅ نسبة متابعين طبيعية")
 
-                if not bio:
-                    score -= 10
-                    risks.append("⚠️ لا يوجد سيرة ذاتية (Bio)")
-                else:
-                    goods.append("✅ السيرة الذاتية موجودة")
+        # السيرة الذاتية
+        if not bio:
+            score -= 10
+            risks.append("⚠️ لا توجد سيرة ذاتية (Bio)")
+        elif len(bio) < 20:
+            score -= 5
+            risks.append("⚠️ السيرة الذاتية قصيرة جداً")
+        else:
+            goods.append("✅ سيرة ذاتية كاملة")
 
-                if is_verified:
-                    score += 10
-                    goods.append("✅ حساب موثّق")
+        # صورة الملف الشخصي
+        if not profile_pic:
+            score -= 10
+            risks.append("⚠️ لا توجد صورة ملف شخصي")
+        else:
+            goods.append("✅ صورة ملف شخصي موجودة")
 
-                if is_business:
-                    goods.append("✅ حساب تجاري")
+        # التوثيق والنوع
+        if is_verified:
+            score = min(100, score + 15)
+            goods.append("✅ حساب موثّق رسمياً ✔️")
 
-                if blocked_by_viewer:
-                    score -= 40
-                    risks.append("🚫 الحساب محظور")
+        if is_business or is_professional:
+            goods.append(f"✅ حساب {'تجاري' if is_business else 'مهني'}")
 
-                score = max(0, min(100, score))
+        # رابط خارجي
+        if external_url:
+            goods.append("✅ رابط خارجي موجود")
 
-                if score >= 80:
-                    status_icon = "🟢"
-                    status_text = "بصحة جيدة"
-                elif score >= 50:
-                    status_icon = "🟡"
-                    status_text = "يحتاج تحسين"
-                else:
-                    status_icon = "🔴"
-                    status_text = "خطر حظر مرتفع"
+        # القيود والحظر
+        if blocked:
+            score -= 50
+            risks.append("🚫 الحساب محظور من عرض البيانات")
+        if restricted:
+            score -= 20
+            risks.append("⚠️ الحساب مقيّد")
 
-                result = (
-                    f"{status_icon} <b>تقرير حساب @{username}</b>\n"
-                    f"━━━━━━━━━━━━━━━━━\n"
-                    f"👤 الاسم: {full_name}\n"
-                    f"{'🔒 خاص' if is_private else '🌐 عام'} | "
-                    f"{'✔️ موثّق' if is_verified else '○ غير موثّق'}\n\n"
-                    f"📊 <b>الإحصائيات:</b>\n"
-                    f"• المتابعون: {followers:,}\n"
-                    f"• المتابَعون: {following:,}\n"
-                    f"• المنشورات: {posts}\n\n"
-                    f"🏥 <b>تقييم الصحة: {score}/100 — {status_text}</b>\n\n"
-                )
+        # الحساب الخاص
+        if is_private:
+            score -= 5
+            risks.append("🔒 الحساب خاص (يؤثر على النمو)")
 
-                if goods:
-                    result += "✅ <b>إيجابيات:</b>\n" + "\n".join(goods) + "\n\n"
-                if risks:
-                    result += "⚠️ <b>مخاطر:</b>\n" + "\n".join(risks) + "\n\n"
+        score = max(0, min(100, score))
 
-                if score < 50:
-                    result += "💡 <b>نصيحة:</b> أضف منشورات، سيرة ذاتية، وتفاعل بشكل طبيعي لتقليل خطر الحظر."
-                elif score < 80:
-                    result += "💡 <b>نصيحة:</b> الحساب بحاجة لنشاط أكثر لتحسين وضعه."
-                else:
-                    result += "💡 الحساب في وضع جيد، استمر في النشاط الطبيعي."
+        # ── تحديد الحالة ──────────────────────────────────────────
+        if score >= 80:
+            health_icon = "🟢"
+            health_text = "صحة ممتازة"
+            ban_risk = "خطر حظر منخفض جداً"
+        elif score >= 60:
+            health_icon = "🟡"
+            health_text = "صحة جيدة"
+            ban_risk = "خطر حظر منخفض"
+        elif score >= 40:
+            health_icon = "🟠"
+            health_text = "يحتاج تحسين"
+            ban_risk = "خطر حظر متوسط"
+        else:
+            health_icon = "🔴"
+            health_text = "وضع خطر"
+            ban_risk = "خطر حظر مرتفع ⚠️"
 
-                await status_msg.edit_text(result, parse_mode="HTML")
+        # نصيحة مخصصة
+        if score < 40:
+            tip = ("💡 <b>توصيات عاجلة:</b>\n"
+                   "• أضف منشورات حقيقية يومياً\n"
+                   "• أضف سيرة ذاتية وصورة ملف\n"
+                   "• قلّل من عمليات المتابعة/الإلغاء السريعة\n"
+                   "• تفاعل بشكل طبيعي مع المنشورات")
+        elif score < 70:
+            tip = ("💡 <b>توصيات لتحسين الحساب:</b>\n"
+                   "• زد من تكرار النشر\n"
+                   "• أكمل بيانات الملف الشخصي\n"
+                   "• تفاعل مع متابعيك")
+        else:
+            tip = "💡 الحساب في وضع جيد. استمر في النشاط الطبيعي والمنتظم."
+
+        # ── بناء التقرير ──────────────────────────────────────────
+        result = (
+            f"{health_icon} <b>تقرير فحص @{username}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 الاسم الكامل: <b>{full_name}</b>\n"
+            f"{'🔒 خاص' if is_private else '🌐 عام'} | "
+            f"{'✔️ موثّق' if is_verified else '○ غير موثّق'}"
+            f"{' | ' + category if category else ''}\n\n"
+            f"📊 <b>الإحصائيات:</b>\n"
+            f"• 👥 المتابعون: <b>{followers:,}</b>\n"
+            f"• 👣 يتابع: <b>{following:,}</b>\n"
+            f"• 📸 المنشورات: <b>{posts}</b>\n"
+        )
+
+        if igtv_count:
+            result += f"• 📹 IGTV: {igtv_count}\n"
+        if highlight_reel:
+            result += f"• 🔵 Highlights: {highlight_reel}\n"
+
+        result += (
+            f"\n🏥 <b>تقييم الصحة: {score}/100</b>\n"
+            f"📌 الحالة: {health_text}\n"
+            f"🚨 {ban_risk}\n\n"
+        )
+
+        if goods:
+            result += "✅ <b>نقاط قوة:</b>\n" + "\n".join(goods) + "\n\n"
+        if risks:
+            result += "⚠️ <b>نقاط ضعف / مخاطر:</b>\n" + "\n".join(risks) + "\n\n"
+
+        result += tip
+
+        if external_url:
+            result += f"\n\n🔗 <a href='{external_url}'>الموقع الإلكتروني</a>"
+
+        await status_msg.edit_text(result, parse_mode="HTML", disable_web_page_preview=True)
 
     except Exception as e:
         logger.error(f"Instagram check error: {e}")
         await status_msg.edit_text(
-            f"❌ تعذّر فحص الحساب. تأكد من اسم المستخدم وحاول مرة أخرى.",
+            f"❌ تعذّر فحص الحساب @{username}.\n\n"
+            "السبب المحتمل: إنستغرام يحجب الطلبات أحياناً. حاول مرة أخرى بعد قليل.",
             parse_mode="HTML",
         )
 
