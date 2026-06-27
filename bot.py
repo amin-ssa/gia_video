@@ -272,79 +272,168 @@ async def check_instagram_account(update: Update, context: ContextTypes.DEFAULT_
 
     status_msg = await update.message.reply_text(f"🔍 جاري فحص حساب @{username} ...")
 
-    headers = {
+    # نستخدم صفحة HTML مباشرة + picuki كبديل لتجاوز حجب API
+    page_headers = {
         "User-Agent": (
-            "Mozilla/5.0 (Linux; Android 12; SM-G991B) "
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Mobile Safari/537.36 Instagram/313.0.0.0"
+            "Chrome/124.0.0.0 Safari/537.36"
         ),
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "ar,en;q=0.9",
-        "x-ig-app-id": "936619743392459",
-        "x-requested-with": "XMLHttpRequest",
-        "Referer": f"https://www.instagram.com/{username}/",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
     }
+
+    user = {}
 
     try:
         async with aiohttp.ClientSession() as session:
-            # المصدر الأول: web_profile_info
-            api_url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
-            async with session.get(api_url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as resp:
-                raw_text = await resp.text()
+            # ─── المحاولة 1: صفحة picuki العامة ───────────────────
+            picuki_url = f"https://www.picuki.com/profile/{username}"
+            try:
+                async with session.get(picuki_url, headers=page_headers, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                    if resp.status == 200:
+                        html = await resp.text()
+                        # استخراج البيانات من HTML
+                        import re as _re
+                        followers_m  = _re.search(r'(\d[\d,\.]+)\s*[Ff]ollowers', html)
+                        following_m  = _re.search(r'(\d[\d,\.]+)\s*[Ff]ollowing', html)
+                        posts_m      = _re.search(r'(\d[\d,\.]+)\s*[Pp]osts', html)
+                        name_m       = _re.search(r'<div class="profile-name-top"[^>]*>(.*?)</div>', html, _re.S)
+                        bio_m        = _re.search(r'<div class="profile-description"[^>]*>(.*?)</div>', html, _re.S)
+                        verified_m   = 'verified' in html.lower()
+                        private_m    = 'private' in html.lower() and 'private account' in html.lower()
 
-                if resp.status == 404:
-                    await status_msg.edit_text(
-                        f"❌ <b>الحساب غير موجود أو محذوف</b>\n\n@{username}",
-                        parse_mode="HTML",
-                    )
-                    return
+                        def parse_num(s):
+                            if not s:
+                                return 0
+                            return int(s.replace(',', '').replace('.', '').strip())
 
-                if resp.status == 401 or resp.status == 403:
-                    await status_msg.edit_text(
-                        f"🔒 <b>الحساب خاص أو مقيّد</b>\n\n"
-                        f"@{username} لا يسمح بالوصول العام للبيانات.\n\n"
-                        f"🔗 <a href='https://www.instagram.com/{username}/'>افتح الحساب مباشرة</a>",
-                        parse_mode="HTML",
-                        disable_web_page_preview=False,
-                    )
-                    return
+                        if followers_m or posts_m:
+                            user = {
+                                "source": "picuki",
+                                "full_name": _re.sub(r'<[^>]+>', '', name_m.group(1)).strip() if name_m else "—",
+                                "followers": parse_num(followers_m.group(1)) if followers_m else 0,
+                                "following": parse_num(following_m.group(1)) if following_m else 0,
+                                "posts": parse_num(posts_m.group(1)) if posts_m else 0,
+                                "bio": _re.sub(r'<[^>]+>', '', bio_m.group(1)).strip() if bio_m else "",
+                                "is_verified": verified_m,
+                                "is_private": private_m,
+                                "is_business": False,
+                                "profile_pic": "",
+                                "external_url": "",
+                                "blocked": False,
+                                "restricted": False,
+                                "highlight_reel": 0,
+                                "igtv_count": 0,
+                                "category": "",
+                            }
+            except Exception as e:
+                logger.warning(f"Picuki failed: {e}")
 
-                if resp.status != 200:
-                    raise Exception(f"HTTP {resp.status}")
-
+            # ─── المحاولة 2: imginn ──────────────────────────────
+            if not user:
                 try:
-                    data = json.loads(raw_text)
-                except Exception:
-                    raise Exception("فشل تحليل البيانات")
+                    imginn_url = f"https://imginn.com/{username}/"
+                    async with session.get(imginn_url, headers=page_headers, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                        if resp.status == 200:
+                            html = await resp.text()
+                            import re as _re
+                            followers_m = _re.search(r'([\d,]+)\s*</span>\s*[Ff]ollowers', html)
+                            following_m = _re.search(r'([\d,]+)\s*</span>\s*[Ff]ollowing', html)
+                            posts_m     = _re.search(r'([\d,]+)\s*</span>\s*[Pp]osts', html)
+                            name_m      = _re.search(r'<h1[^>]*>(.*?)</h1>', html, _re.S)
 
-                user = data.get("data", {}).get("user", {})
+                            def parse_num(s):
+                                if not s: return 0
+                                return int(s.replace(',', '').strip())
 
-                if not user:
-                    await status_msg.edit_text(
-                        f"⚠️ <b>لا توجد بيانات كافية</b>\n\n"
-                        f"إنستغرام لم يُرجع بيانات للحساب @{username}.\n"
-                        f"قد يكون الحساب محظوراً أو خاصاً جداً.",
-                        parse_mode="HTML",
-                    )
-                    return
+                            if followers_m or posts_m:
+                                user = {
+                                    "source": "imginn",
+                                    "full_name": _re.sub(r'<[^>]+>', '', name_m.group(1)).strip() if name_m else "—",
+                                    "followers": parse_num(followers_m.group(1)) if followers_m else 0,
+                                    "following": parse_num(following_m.group(1)) if following_m else 0,
+                                    "posts": parse_num(posts_m.group(1)) if posts_m else 0,
+                                    "bio": "",
+                                    "is_verified": 'verified' in html.lower(),
+                                    "is_private": False,
+                                    "is_business": False,
+                                    "profile_pic": "",
+                                    "external_url": "",
+                                    "blocked": False,
+                                    "restricted": False,
+                                    "highlight_reel": 0,
+                                    "igtv_count": 0,
+                                    "category": "",
+                                }
+                except Exception as e:
+                    logger.warning(f"Imginn failed: {e}")
+
+            # ─── المحاولة 3: Instagram oEmbed (أساسي) ───────────
+            if not user:
+                try:
+                    oembed = f"https://graph.facebook.com/v18.0/instagram_oembed?url=https://www.instagram.com/{username}/&access_token=null"
+                    # Instagram profile page JSON-LD
+                    ig_page = f"https://www.instagram.com/{username}/"
+                    async with session.get(ig_page, headers=page_headers, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                        if resp.status == 404:
+                            await status_msg.edit_text(
+                                f"❌ <b>الحساب غير موجود أو محذوف</b>\n\n@{username}",
+                                parse_mode="HTML",
+                            )
+                            return
+                        html = await resp.text()
+                        import re as _re
+                        # JSON-LD
+                        ld_m = _re.search(r'<script type="application/ld\+json">(.*?)</script>', html, _re.S)
+                        if ld_m:
+                            ld = json.loads(ld_m.group(1))
+                            name = ld.get("name", "—")
+                            desc = ld.get("description", "")
+                            user = {
+                                "source": "ld+json",
+                                "full_name": name,
+                                "followers": 0, "following": 0, "posts": 0,
+                                "bio": desc,
+                                "is_verified": False, "is_private": False,
+                                "is_business": False, "profile_pic": "",
+                                "external_url": "", "blocked": False,
+                                "restricted": False, "highlight_reel": 0,
+                                "igtv_count": 0, "category": "",
+                            }
+                except Exception as e:
+                    logger.warning(f"IG page fallback failed: {e}")
+
+        if not user:
+            await status_msg.edit_text(
+                f"⚠️ <b>تعذّر جلب بيانات @{username}</b>\n\n"
+                "إنستغرام يحجب الطلبات أحياناً. حاول مرة أخرى بعد دقيقة.\n\n"
+                f"🔗 <a href='https://www.instagram.com/{username}/'>افتح الحساب مباشرة</a>",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            return
 
         # ── استخراج البيانات ───────────────────────────────────────
         full_name      = user.get("full_name") or "—"
-        followers      = user.get("edge_followed_by", {}).get("count", 0)
-        following      = user.get("edge_follow", {}).get("count", 0)
-        posts          = user.get("edge_owner_to_timeline_media", {}).get("count", 0)
+        followers      = user.get("followers", 0)
+        following      = user.get("following", 0)
+        posts          = user.get("posts", 0)
         is_private     = user.get("is_private", False)
         is_verified    = user.get("is_verified", False)
-        is_business    = user.get("is_business_account", False)
-        is_professional= user.get("is_professional_account", False)
-        bio            = user.get("biography", "") or ""
+        is_business    = user.get("is_business", False)
+        is_professional= False
+        bio            = user.get("bio", "") or ""
         external_url   = user.get("external_url") or ""
-        category       = user.get("category_name") or ""
-        profile_pic    = user.get("profile_pic_url_hd") or user.get("profile_pic_url") or ""
-        highlight_reel = user.get("highlight_reel_count", 0)
-        igtv_count     = user.get("edge_felix_video_timeline", {}).get("count", 0)
-        blocked        = user.get("blocked_by_viewer", False)
-        restricted     = user.get("restricted_by_viewer", False)
+        category       = user.get("category") or ""
+        profile_pic    = user.get("profile_pic") or ""
+        highlight_reel = user.get("highlight_reel", 0)
+        igtv_count     = user.get("igtv_count", 0)
+        blocked        = user.get("blocked", False)
+        restricted     = user.get("restricted", False)
+        source         = user.get("source", "unknown")
 
         # ── تقييم الصحة ───────────────────────────────────────────
         score = 100
@@ -553,6 +642,8 @@ async def send_direct_link(update, status_msg, url: str, title: str, file_size: 
 # ─── Download Media ───────────────────────────────────────────────────────────
 
 async def download_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
     user = update.effective_user
     mode = context.user_data.get("mode")
 
