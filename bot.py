@@ -51,14 +51,32 @@ def subscription_keyboard():
     ])
 
 
+def main_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬇️ تحميل فيديو", callback_data="download_prompt")],
+    ])
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
 
+    welcome_text = (
+        f"أهلاً {user.first_name}! 👋\n\n"
+        "🎬 <b>بوت تحميل الفيديوهات</b>\n\n"
+        "📌 <b>المنصات المدعومة:</b>\n"
+        "• يوتيوب 🎥\n"
+        "• إنستغرام 📸\n"
+        "• تيك توك 🎵\n"
+        "• تويتر / X 🐦\n"
+        "• فيسبوك 👍\n"
+        "• وأكثر من 1000 منصة أخرى!\n\n"
+        "اضغط الزر أدناه أو أرسل رابطاً مباشرة 👇"
+    )
+
     if not CHANNEL_ID or CHANNEL_ID == "-1002000000000":
         await update.message.reply_text(
-            f"أهلاً {user.first_name}! 👋\n\n"
-            "أرسل لي رابط أي فيديو أو صورة وسأقوم بتحميلها لك بأعلى جودة ممكنة 🚀\n\n"
-            "📌 يوتيوب، إنستغرام، تيك توك، تويتر/X، فيسبوك، وأكثر!",
+            welcome_text,
+            reply_markup=main_keyboard(),
             parse_mode="HTML",
         )
         return
@@ -67,9 +85,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if subscribed:
         await update.message.reply_text(
-            f"أهلاً {user.first_name}! 👋\n\n"
-            "أرسل لي رابط أي فيديو أو صورة وسأقوم بتحميلها لك بأعلى جودة ممكنة 🚀\n\n"
-            "📌 يوتيوب، إنستغرام، تيك توك، تويتر/X، فيسبوك، وأكثر من 1000 منصة أخرى!",
+            welcome_text,
+            reply_markup=main_keyboard(),
             parse_mode="HTML",
         )
     else:
@@ -90,6 +107,19 @@ async def getid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🆔 <b>معرف هذه المحادثة:</b>\n<code>{chat.id}</code>\n\n"
         f"النوع: {chat.type}\n"
         f"الاسم: {chat.title or chat.username or chat.first_name}",
+        parse_mode="HTML",
+    )
+
+
+async def download_prompt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.message.reply_text(
+        "📎 أرسل لي رابط الفيديو أو الصورة وسأقوم بتحميله فوراً!\n\n"
+        "مثال:\n"
+        "• https://www.youtube.com/watch?v=...\n"
+        "• https://www.instagram.com/p/...\n"
+        "• https://www.tiktok.com/@.../video/...",
         parse_mode="HTML",
     )
 
@@ -288,6 +318,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("getid", getid_command))
+    app.add_handler(CallbackQueryHandler(download_prompt_callback, pattern="^download_prompt$"))
     app.add_handler(CallbackQueryHandler(check_subscription_callback, pattern="^check_sub$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, download_media))
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POSTS, channel_post_handler))
