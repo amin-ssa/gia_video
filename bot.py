@@ -1,7 +1,9 @@
 import os
-import asyncio
+import re
+import json
 import tempfile
 import logging
+import aiohttp
 from pathlib import Path
 import yt_dlp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatMember
@@ -12,6 +14,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
     filters,
+    ConversationHandler,
 )
 
 logging.basicConfig(
@@ -24,13 +27,17 @@ BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHANNEL_ID = os.environ.get("CHANNEL_ID", "").strip()
 CHANNEL_INVITE = os.environ.get("CHANNEL_INVITE", "https://t.me/+i3F-wztDdSlmYWNk")
 
-MAX_FILE_SIZE = 200 * 1024 * 1024  # 200 MB
-TG_UPLOAD_LIMIT = 49 * 1024 * 1024  # 49 MB — حد تيليغرام للرفع
+MAX_FILE_SIZE = 200 * 1024 * 1024
+TG_UPLOAD_LIMIT = 49 * 1024 * 1024
 
+# Conversation states
+WAITING_IG_USERNAME = 1
+
+
+# ─── Helpers ────────────────────────────────────────────────────────────────
 
 async def is_subscribed(bot, user_id: int) -> bool:
     if not CHANNEL_ID or CHANNEL_ID == "-1002000000000":
-        logger.warning("CHANNEL_ID not configured — skipping subscription check")
         return True
     try:
         member = await bot.get_chat_member(chat_id=int(CHANNEL_ID), user_id=user_id)
@@ -53,9 +60,24 @@ def subscription_keyboard():
 
 def main_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⬇️ تحميل فيديو", callback_data="download_prompt")],
+        [InlineKeyboardButton("⬇️ تحميل فيديو", callback_data="download_prompt"),
+         InlineKeyboardButton("🎵 تحميل MP3", callback_data="mp3_prompt")],
+        [InlineKeyboardButton("🎛️ اختيار الجودة", callback_data="quality_menu"),
+         InlineKeyboardButton("📊 فحص حساب انستا", callback_data="ig_check")],
     ])
 
+
+def quality_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔵 360p", callback_data="q_360"),
+         InlineKeyboardButton("🟢 720p", callback_data="q_720")],
+        [InlineKeyboardButton("🟡 1080p", callback_data="q_1080"),
+         InlineKeyboardButton("⭐ أعلى جودة", callback_data="q_best")],
+        [InlineKeyboardButton("🔙 رجوع", callback_data="back_main")],
+    ])
+
+
+# ─── Start ───────────────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -70,25 +92,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• تويتر / X 🐦\n"
         "• فيسبوك 👍\n"
         "• وأكثر من 1000 منصة أخرى!\n\n"
-        "اضغط الزر أدناه أو أرسل رابطاً مباشرة 👇"
+        "اختر من القائمة أو أرسل رابطاً مباشرة 👇"
     )
 
     if not CHANNEL_ID or CHANNEL_ID == "-1002000000000":
-        await update.message.reply_text(
-            welcome_text,
-            reply_markup=main_keyboard(),
-            parse_mode="HTML",
-        )
+        await update.message.reply_text(welcome_text, reply_markup=main_keyboard(), parse_mode="HTML")
         return
 
     subscribed = await is_subscribed(context.bot, user.id)
 
     if subscribed:
-        await update.message.reply_text(
-            welcome_text,
-            reply_markup=main_keyboard(),
-            parse_mode="HTML",
-        )
+        await update.message.reply_text(welcome_text, reply_markup=main_keyboard(), parse_mode="HTML")
     else:
         await update.message.reply_text(
             f"أهلاً {user.first_name}! 👋\n\n"
@@ -111,9 +125,12 @@ async def getid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ─── Callback Buttons ────────────────────────────────────────────────────────
+
 async def download_prompt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    context.user_data["mode"] = "video"
     await query.message.reply_text(
         "📎 أرسل لي رابط الفيديو أو الصورة وسأقوم بتحميله فوراً!\n\n"
         "مثال:\n"
@@ -124,36 +141,236 @@ async def download_prompt_callback(update: Update, context: ContextTypes.DEFAULT
     )
 
 
+async def mp3_prompt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data["mode"] = "mp3"
+    await query.message.reply_text(
+        "🎵 أرسل لي رابط الفيديو وسأستخرج الصوت بصيغة MP3!\n\n"
+        "مثال:\n"
+        "• https://www.youtube.com/watch?v=...\n"
+        "• https://www.tiktok.com/@.../video/...",
+        parse_mode="HTML",
+    )
+
+
+async def quality_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    current = context.user_data.get("quality", "best")
+    labels = {"360": "360p", "720": "720p", "1080": "1080p", "best": "أعلى جودة"}
+    await query.edit_message_text(
+        f"🎛️ <b>اختر جودة التحميل</b>\n\nالجودة الحالية: <b>{labels.get(current, 'أعلى جودة')}</b>\n\n"
+        "بعد الاختيار أرسل الرابط مباشرة.",
+        reply_markup=quality_keyboard(),
+        parse_mode="HTML",
+    )
+
+
+async def quality_select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    q = query.data.replace("q_", "")
+    context.user_data["quality"] = q
+    context.user_data["mode"] = "video"
+    labels = {"360": "360p 🔵", "720": "720p 🟢", "1080": "1080p 🟡", "best": "أعلى جودة ⭐"}
+    await query.edit_message_text(
+        f"✅ تم اختيار الجودة: <b>{labels.get(q, q)}</b>\n\nأرسل لي الرابط الآن 👇",
+        parse_mode="HTML",
+    )
+
+
+async def back_main_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        "🎬 <b>بوت تحميل الفيديوهات</b>\n\nاختر من القائمة أو أرسل رابطاً مباشرة 👇",
+        reply_markup=main_keyboard(),
+        parse_mode="HTML",
+    )
+
+
 async def check_subscription_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     user = query.from_user
 
     if not CHANNEL_ID or CHANNEL_ID == "-1002000000000":
         await query.edit_message_text(
-            "✅ <b>تم التحقق! أرسل لي رابط الفيديو أو الصورة.</b>",
+            "✅ <b>تم التحقق! اختر من القائمة أو أرسل رابطاً.</b>",
+            reply_markup=main_keyboard(),
             parse_mode="HTML",
         )
         return
 
     subscribed = await is_subscribed(context.bot, user.id)
-
     if subscribed:
         await query.edit_message_text(
-            "✅ <b>تم التحقق من اشتراكك بنجاح!</b>\n\n"
-            "أرسل لي رابط أي فيديو أو صورة وسأقوم بتحميلها لك بأعلى جودة ممكنة 🚀\n\n"
-            "📌 يوتيوب، إنستغرام، تيك توك، تويتر/X، فيسبوك، وأكثر من 1000 منصة!",
+            "✅ <b>تم التحقق من اشتراكك بنجاح!</b>\n\nاختر من القائمة أو أرسل رابطاً 👇",
+            reply_markup=main_keyboard(),
             parse_mode="HTML",
         )
     else:
         await query.edit_message_text(
-            "❌ <b>لم يتم الاشتراك بعد!</b>\n\n"
-            "تأكد من الاشتراك في القناة ثم اضغط تحقق مرة أخرى.",
+            "❌ <b>لم يتم الاشتراك بعد!</b>\n\nتأكد من الاشتراك ثم اضغط تحقق مرة أخرى.",
             reply_markup=subscription_keyboard(),
             parse_mode="HTML",
         )
 
+
+# ─── Instagram Account Checker ───────────────────────────────────────────────
+
+async def ig_check_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data["mode"] = "ig_check"
+    await query.message.reply_text(
+        "📊 <b>فحص حساب إنستغرام</b>\n\n"
+        "أرسل لي اسم المستخدم (username) للحساب الذي تريد فحصه:\n\n"
+        "مثال: <code>cristiano</code>",
+        parse_mode="HTML",
+    )
+
+
+async def check_instagram_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    username = update.message.text.strip().lstrip("@").lower()
+    status_msg = await update.message.reply_text(f"🔍 جاري فحص حساب @{username} ...")
+    context.user_data["mode"] = None
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15",
+        "Accept": "application/json",
+        "x-ig-app-id": "936619743392459",
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status == 404:
+                    await status_msg.edit_text(
+                        f"❌ <b>الحساب غير موجود</b>\n\n"
+                        f"لم يتم العثور على حساب باسم @{username}",
+                        parse_mode="HTML",
+                    )
+                    return
+
+                if resp.status != 200:
+                    raise Exception(f"HTTP {resp.status}")
+
+                data = await resp.json()
+                user = data.get("data", {}).get("user", {})
+
+                if not user:
+                    await status_msg.edit_text(
+                        f"⚠️ <b>تعذّر الوصول للبيانات</b>\n\n"
+                        f"قد يكون الحساب خاصاً جداً أو محظوراً.",
+                        parse_mode="HTML",
+                    )
+                    return
+
+                full_name = user.get("full_name", "—")
+                followers = user.get("edge_followed_by", {}).get("count", 0)
+                following = user.get("edge_follow", {}).get("count", 0)
+                posts = user.get("edge_owner_to_timeline_media", {}).get("count", 0)
+                is_private = user.get("is_private", False)
+                is_verified = user.get("is_verified", False)
+                is_business = user.get("is_business_account", False)
+                bio = user.get("biography", "")
+                blocked_by_viewer = user.get("blocked_by_viewer", False)
+                has_profile_pic = user.get("has_public_story", False)
+
+                # تقييم صحة الحساب
+                score = 100
+                risks = []
+                goods = []
+
+                if posts == 0:
+                    score -= 30
+                    risks.append("⚠️ لا يوجد منشورات")
+                else:
+                    goods.append(f"✅ {posts} منشور")
+
+                if followers == 0:
+                    score -= 20
+                    risks.append("⚠️ صفر متابعين")
+                elif followers < 10:
+                    score -= 10
+                    risks.append("⚠️ متابعون قليلون جداً")
+                else:
+                    goods.append(f"✅ {followers:,} متابع")
+
+                if following > 0 and followers > 0:
+                    ratio = following / max(followers, 1)
+                    if ratio > 10:
+                        score -= 20
+                        risks.append("⚠️ نسبة المتابَعين/المتابِعين مرتفعة جداً")
+
+                if not bio:
+                    score -= 10
+                    risks.append("⚠️ لا يوجد سيرة ذاتية (Bio)")
+                else:
+                    goods.append("✅ السيرة الذاتية موجودة")
+
+                if is_verified:
+                    score += 10
+                    goods.append("✅ حساب موثّق")
+
+                if is_business:
+                    goods.append("✅ حساب تجاري")
+
+                if blocked_by_viewer:
+                    score -= 40
+                    risks.append("🚫 الحساب محظور")
+
+                score = max(0, min(100, score))
+
+                if score >= 80:
+                    status_icon = "🟢"
+                    status_text = "بصحة جيدة"
+                elif score >= 50:
+                    status_icon = "🟡"
+                    status_text = "يحتاج تحسين"
+                else:
+                    status_icon = "🔴"
+                    status_text = "خطر حظر مرتفع"
+
+                result = (
+                    f"{status_icon} <b>تقرير حساب @{username}</b>\n"
+                    f"━━━━━━━━━━━━━━━━━\n"
+                    f"👤 الاسم: {full_name}\n"
+                    f"{'🔒 خاص' if is_private else '🌐 عام'} | "
+                    f"{'✔️ موثّق' if is_verified else '○ غير موثّق'}\n\n"
+                    f"📊 <b>الإحصائيات:</b>\n"
+                    f"• المتابعون: {followers:,}\n"
+                    f"• المتابَعون: {following:,}\n"
+                    f"• المنشورات: {posts}\n\n"
+                    f"🏥 <b>تقييم الصحة: {score}/100 — {status_text}</b>\n\n"
+                )
+
+                if goods:
+                    result += "✅ <b>إيجابيات:</b>\n" + "\n".join(goods) + "\n\n"
+                if risks:
+                    result += "⚠️ <b>مخاطر:</b>\n" + "\n".join(risks) + "\n\n"
+
+                if score < 50:
+                    result += "💡 <b>نصيحة:</b> أضف منشورات، سيرة ذاتية، وتفاعل بشكل طبيعي لتقليل خطر الحظر."
+                elif score < 80:
+                    result += "💡 <b>نصيحة:</b> الحساب بحاجة لنشاط أكثر لتحسين وضعه."
+                else:
+                    result += "💡 الحساب في وضع جيد، استمر في النشاط الطبيعي."
+
+                await status_msg.edit_text(result, parse_mode="HTML")
+
+    except Exception as e:
+        logger.error(f"Instagram check error: {e}")
+        await status_msg.edit_text(
+            f"❌ تعذّر فحص الحساب. تأكد من اسم المستخدم وحاول مرة أخرى.",
+            parse_mode="HTML",
+        )
+
+
+# ─── Direct Link for Large Files ─────────────────────────────────────────────
 
 async def send_direct_link(update, status_msg, url: str, title: str, file_size: int):
     try:
@@ -172,10 +389,9 @@ async def send_direct_link(update, status_msg, url: str, title: str, file_size: 
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("⬇️ تنزيل الفيديو مباشرة", url=direct_url)],
         ])
-
         await status_msg.edit_text(
             f"📦 <b>{title}</b>\n\n"
-            f"⚠️ حجم الفيديو كبير جداً ({size_mb} MB) لإرساله عبر تيليغرام.\n\n"
+            f"⚠️ حجم الفيديو ({size_mb} MB) كبير جداً للإرسال عبر تيليغرام.\n\n"
             "اضغط الزر أدناه لتنزيله مباشرة على جهازك 👇",
             reply_markup=keyboard,
             parse_mode="HTML",
@@ -186,83 +402,107 @@ async def send_direct_link(update, status_msg, url: str, title: str, file_size: 
             [InlineKeyboardButton("🔗 فتح الرابط الأصلي", url=url)],
         ])
         await status_msg.edit_text(
-            f"⚠️ الفيديو كبير جداً للإرسال عبر تيليغرام.\n\n"
-            "اضغط الزر أدناه لفتح الرابط وتنزيله مباشرة 👇",
+            "⚠️ الفيديو كبير جداً للإرسال. اضغط الزر للتنزيل المباشر 👇",
             reply_markup=keyboard,
             parse_mode="HTML",
         )
 
 
+# ─── Download Media ───────────────────────────────────────────────────────────
+
 async def download_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    mode = context.user_data.get("mode")
 
+    # إذا كان في وضع فحص انستا
+    if mode == "ig_check":
+        await check_instagram_account(update, context)
+        return
+
+    # التحقق من الاشتراك
     if CHANNEL_ID and CHANNEL_ID != "-1002000000000":
         subscribed = await is_subscribed(context.bot, user.id)
         if not subscribed:
             await update.message.reply_text(
-                "⚠️ يجب الاشتراك في القناة أولاً للاستخدام البوت.",
+                "⚠️ يجب الاشتراك في القناة أولاً.",
                 reply_markup=subscription_keyboard(),
             )
             return
 
     url = update.message.text.strip()
-
     if not (url.startswith("http://") or url.startswith("https://")):
         await update.message.reply_text(
-            "❌ الرجاء إرسال رابط صحيح يبدأ بـ http:// أو https://"
+            "❌ الرجاء إرسال رابط صحيح يبدأ بـ http:// أو https://\n\n"
+            "أو اختر من القائمة:",
+            reply_markup=main_keyboard(),
         )
         return
 
+    quality = context.user_data.get("quality", "best")
+    is_mp3 = mode == "mp3"
+
     status_msg = await update.message.reply_text("🔍 جاري فحص الفيديو...")
 
-    info_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "socket_timeout": 30,
-    }
+    info_opts = {"quiet": True, "no_warnings": True, "skip_download": True, "socket_timeout": 30}
 
     try:
         with yt_dlp.YoutubeDL(info_opts) as ydl:
             info = ydl.extract_info(url, download=False)
 
         title = info.get("title", "media")[:50]
-
-        # تقدير الحجم قبل التنزيل
         estimated_size = info.get("filesize") or info.get("filesize_approx") or 0
 
-        if estimated_size > MAX_FILE_SIZE:
+        if not is_mp3 and estimated_size > MAX_FILE_SIZE:
             await status_msg.edit_text("🔗 الفيديو أكبر من 200 MB، جاري تجهيز رابط التنزيل المباشر...")
             await send_direct_link(update, status_msg, url, title, estimated_size)
             return
 
-        await status_msg.edit_text("⏳ جاري التحميل، الرجاء الانتظار...")
+        if is_mp3:
+            await status_msg.edit_text("🎵 جاري استخراج الصوت MP3...")
+        else:
+            labels = {"360": "360p", "720": "720p", "1080": "1080p", "best": "أعلى جودة"}
+            await status_msg.edit_text(f"⏳ جاري التحميل بجودة {labels.get(quality, quality)}...")
 
         with tempfile.TemporaryDirectory() as tmpdir:
             output_path = os.path.join(tmpdir, "%(title).50s.%(ext)s")
 
-            ydl_opts = {
-                "outtmpl": output_path,
-                "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best",
-                "merge_output_format": "mp4",
-                "quiet": True,
-                "no_warnings": True,
-                "socket_timeout": 30,
-            }
+            if is_mp3:
+                ydl_opts = {
+                    "outtmpl": output_path,
+                    "format": "bestaudio/best",
+                    "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
+                    "quiet": True,
+                    "no_warnings": True,
+                    "socket_timeout": 30,
+                }
+            else:
+                fmt_map = {
+                    "360": "bestvideo[height<=360][ext=mp4]+bestaudio/best[height<=360]",
+                    "720": "bestvideo[height<=720][ext=mp4]+bestaudio/best[height<=720]",
+                    "1080": "bestvideo[height<=1080][ext=mp4]+bestaudio/best[height<=1080]",
+                    "best": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best",
+                }
+                ydl_opts = {
+                    "outtmpl": output_path,
+                    "format": fmt_map.get(quality, fmt_map["best"]),
+                    "merge_output_format": "mp4",
+                    "quiet": True,
+                    "no_warnings": True,
+                    "socket_timeout": 30,
+                }
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.extract_info(url, download=True)
 
             downloaded_files = list(Path(tmpdir).iterdir())
             if not downloaded_files:
-                raise Exception("لم يتم العثور على ملف بعد التحميل")
+                raise Exception("لم يتم العثور على ملف")
 
             file_path = str(downloaded_files[0])
             file_size = os.path.getsize(file_path)
             ext = Path(file_path).suffix.lower()
 
-            # إذا تجاوز 200 MB بعد التنزيل الفعلي
-            if file_size > MAX_FILE_SIZE:
+            if not is_mp3 and file_size > MAX_FILE_SIZE:
                 await status_msg.edit_text("🔗 الفيديو أكبر من 200 MB، جاري تجهيز رابط التنزيل المباشر...")
                 await send_direct_link(update, status_msg, url, title, file_size)
                 return
@@ -273,7 +513,14 @@ async def download_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             try:
                 with open(file_path, "rb") as media_file:
-                    if ext in image_exts:
+                    if is_mp3 or ext == ".mp3":
+                        await update.message.reply_audio(
+                            audio=media_file,
+                            title=title,
+                            caption=f"🎵 <b>{title}</b>",
+                            parse_mode="HTML",
+                        )
+                    elif ext in image_exts:
                         await update.message.reply_photo(
                             photo=media_file,
                             caption=f"📥 <b>{title}</b>",
@@ -288,44 +535,47 @@ async def download_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         )
                 await status_msg.delete()
             except Exception as upload_err:
-                # فشل الرفع لتيليغرام (عادةً >50MB) → أرسل رابط مباشر
-                logger.warning(f"Telegram upload failed: {upload_err}")
-                await status_msg.edit_text("🔗 تعذّر إرسال الملف عبر تيليغرام، جاري تجهيز رابط مباشر...")
+                logger.warning(f"Upload failed: {upload_err}")
+                await status_msg.edit_text("🔗 تعذّر الإرسال، جاري تجهيز رابط مباشر...")
                 await send_direct_link(update, status_msg, url, title, file_size)
 
     except yt_dlp.utils.DownloadError as e:
         logger.error(f"Download error: {e}")
-        await status_msg.edit_text(
-            "❌ فشل التحميل. تأكد أن الرابط صحيح وأن المحتوى متاح للعموم."
-        )
+        await status_msg.edit_text("❌ فشل التحميل. تأكد أن الرابط صحيح وأن المحتوى متاح للعموم.")
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
-        await status_msg.edit_text(
-            "❌ حدث خطأ غير متوقع. الرجاء المحاولة مرة أخرى."
-        )
+        await status_msg.edit_text("❌ حدث خطأ غير متوقع. الرجاء المحاولة مرة أخرى.")
 
 
 async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.channel_post:
         chat_id = update.channel_post.chat_id
         chat_title = update.channel_post.chat.title
-        print(f"✅ Channel ID detected: {chat_id} — {chat_title}", flush=True)
+        print(f"✅ Channel ID: {chat_id} — {chat_title}", flush=True)
         logger.info(f"Channel ID: {chat_id} — {chat_title}")
 
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("getid", getid_command))
+
     app.add_handler(CallbackQueryHandler(download_prompt_callback, pattern="^download_prompt$"))
+    app.add_handler(CallbackQueryHandler(mp3_prompt_callback, pattern="^mp3_prompt$"))
+    app.add_handler(CallbackQueryHandler(quality_menu_callback, pattern="^quality_menu$"))
+    app.add_handler(CallbackQueryHandler(quality_select_callback, pattern="^q_(360|720|1080|best)$"))
+    app.add_handler(CallbackQueryHandler(back_main_callback, pattern="^back_main$"))
     app.add_handler(CallbackQueryHandler(check_subscription_callback, pattern="^check_sub$"))
+    app.add_handler(CallbackQueryHandler(ig_check_callback, pattern="^ig_check$"))
+
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, download_media))
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POSTS, channel_post_handler))
 
     logger.info("Bot started!")
     print("🤖 البوت يعمل الآن...", flush=True)
-    print(f"📢 CHANNEL_ID الحالي: {CHANNEL_ID or 'غير مضبوط'}", flush=True)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
