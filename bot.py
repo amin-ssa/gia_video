@@ -34,6 +34,7 @@ BOT_TOKEN      = os.environ["TELEGRAM_BOT_TOKEN"]
 CHANNEL_ID     = os.environ.get("CHANNEL_ID", "").strip()
 CHANNEL_INVITE = os.environ.get("CHANNEL_INVITE", "https://t.me/+i3F-wztDdSlmYWNk")
 ELEVENLABS_KEY = os.environ.get("ELEVENLABS_KEY", "")
+GEMINI_KEY     = os.environ.get("GEMINI_KEY", "")
 
 MAX_FILE_SIZE  = 200 * 1024 * 1024
 TG_UPLOAD_LIMIT =  49 * 1024 * 1024
@@ -49,15 +50,18 @@ EL_DEL_URL   = "https://api.elevenlabs.io/v1/voices/{voice_id}"
 def main_keyboard():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("⬇️ تحميل فيديو",   callback_data="download_prompt"),
-            InlineKeyboardButton("🎵 تحميل MP3",      callback_data="mp3_prompt"),
+            InlineKeyboardButton("⬇️ تحميل فيديو",         callback_data="download_prompt"),
+            InlineKeyboardButton("🎵 تحميل MP3",            callback_data="mp3_prompt"),
         ],
         [
-            InlineKeyboardButton("🎛️ اختيار الجودة",  callback_data="quality_menu"),
-            InlineKeyboardButton("📊 فحص انستا",       callback_data="ig_check"),
+            InlineKeyboardButton("🎛️ اختيار الجودة",        callback_data="quality_menu"),
+            InlineKeyboardButton("📊 فحص انستا",             callback_data="ig_check"),
         ],
         [
-            InlineKeyboardButton("🎤 استنساخ الصوت",  callback_data="voice_clone"),
+            InlineKeyboardButton("🎤 استنساخ الصوت",        callback_data="voice_clone"),
+        ],
+        [
+            InlineKeyboardButton("🧠 تحميل فيديو مع تحليل", callback_data="smart_download"),
         ],
     ])
 
@@ -89,6 +93,32 @@ def voice_clone_keyboard(has_voice: bool = False):
         rows.append([InlineKeyboardButton("🗑️ حذف الصوت المستنسخ", callback_data="vc_delete")])
     rows.append([InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="back_main")])
     return InlineKeyboardMarkup(rows)
+
+
+def smart_quality_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔵 360p",  callback_data="sdq_360"),
+            InlineKeyboardButton("🟢 720p",  callback_data="sdq_720"),
+        ],
+        [
+            InlineKeyboardButton("🟡 1080p", callback_data="sdq_1080"),
+            InlineKeyboardButton("⭐ أعلى جودة", callback_data="sdq_best"),
+        ],
+        [InlineKeyboardButton("🔙 رجوع", callback_data="back_main")],
+    ])
+
+
+def smart_platform_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📸 إنستغرام", callback_data="sdp_instagram"),
+            InlineKeyboardButton("🎵 تيك توك",  callback_data="sdp_tiktok"),
+        ],
+        [
+            InlineKeyboardButton("▶️ يوتيوب",   callback_data="sdp_youtube"),
+        ],
+    ])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -293,6 +323,9 @@ async def download_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if mode == "voice_clone_waiting_text":
         await _handle_voice_text(update, context)
+        return
+    if mode == "smart_dl_url":
+        await _handle_smart_dl_url(update, context)
         return
 
     # ── subscription gate ────────────────────────────────────────────────────
@@ -939,7 +972,355 @@ async def vc_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ░░  SECTION F — CHANNEL POST ID LOGGER  ░░
+#  ░░  SECTION F — SMART DOWNLOAD WITH CONTENT ANALYSIS  ░░
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def smart_download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data["mode"] = "smart_dl_url"
+    context.user_data.pop("smart_dl_info", None)
+    await query.message.reply_text(
+        "🧠 <b>تحميل فيديو مع تحليل المحتوى</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "أرسل لي رابط الفيديو الذي تريد تحميله:\n\n"
+        "• https://www.youtube.com/watch?v=...\n"
+        "• https://www.tiktok.com/@.../video/...\n"
+        "• https://www.instagram.com/reel/...\n"
+        "• أو أي رابط فيديو آخر",
+        parse_mode="HTML",
+    )
+
+
+async def _handle_smart_dl_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 1: user sent URL → fetch info → show quality selection."""
+    url = update.message.text.strip()
+    if not (url.startswith("http://") or url.startswith("https://")):
+        await update.message.reply_text(
+            "❌ الرجاء إرسال رابط صحيح يبدأ بـ http:// أو https://",
+        )
+        return
+
+    status_msg = await update.message.reply_text("🔍 جاري فحص الفيديو...")
+    try:
+        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "skip_download": True, "socket_timeout": 30}) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+        title    = info.get("title", "فيديو")[:120]
+        duration = info.get("duration", 0)
+        channel  = info.get("uploader") or info.get("channel") or info.get("creator") or ""
+        desc     = info.get("description", "") or ""
+        tags     = info.get("tags") or []
+        thumb    = info.get("thumbnail", "")
+        size_b   = info.get("filesize") or info.get("filesize_approx") or 0
+        size_mb  = round(size_b / 1024 / 1024, 1) if size_b else 0
+
+        context.user_data["smart_dl_info"] = {
+            "url":     url,
+            "title":   title,
+            "channel": channel,
+            "desc":    desc[:1500],
+            "tags":    tags[:30],
+            "thumb":   thumb,
+            "duration": duration,
+        }
+        context.user_data["mode"] = "smart_dl_quality"
+
+        dur_str = f"{duration // 60}:{duration % 60:02d}" if duration else "—"
+        size_str = f"{size_mb} MB" if size_mb else "غير محدد"
+
+        await status_msg.edit_text(
+            f"📹 <b>{title}</b>\n\n"
+            f"📺 <b>القناة:</b> {channel or '—'}\n"
+            f"⏱ <b>المدة:</b> {dur_str}\n"
+            f"📦 <b>الحجم المقدّر:</b> {size_str}\n\n"
+            "🎛️ <b>اختر جودة التحميل:</b>",
+            reply_markup=smart_quality_keyboard(),
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.error(f"Smart DL info error: {e}")
+        context.user_data["mode"] = "smart_dl_url"
+        await status_msg.edit_text(
+            "❌ تعذّر فحص الفيديو. تأكد من الرابط وحاول مرة أخرى.\n\n"
+            f"<code>{str(e)[:200]}</code>",
+            parse_mode="HTML",
+        )
+
+
+async def smart_quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 2: quality chosen → download → send file or link → show platform button."""
+    query = update.callback_query
+    await query.answer()
+
+    info_stored = context.user_data.get("smart_dl_info")
+    if not info_stored:
+        await query.edit_message_text(
+            "⚠️ انتهت الجلسة. ابدأ من جديد.",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    quality = query.data.replace("sdq_", "")   # 360 | 720 | 1080 | best
+    url     = info_stored["url"]
+    title   = info_stored["title"]
+    context.user_data["mode"] = None
+
+    labels = {"360": "360p 🔵", "720": "720p 🟢", "1080": "1080p 🟡", "best": "أعلى جودة ⭐"}
+    await query.edit_message_text(
+        f"⏳ جاري التحميل بجودة <b>{labels.get(quality, quality)}</b>...\n\n"
+        f"📹 <i>{title[:60]}</i>",
+        parse_mode="HTML",
+    )
+
+    fmt_map = {
+        "360":  "bestvideo[height<=360][ext=mp4]+bestaudio/best[height<=360]",
+        "720":  "bestvideo[height<=720][ext=mp4]+bestaudio/best[height<=720]",
+        "1080": "bestvideo[height<=1080][ext=mp4]+bestaudio/best[height<=1080]",
+        "best": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best",
+    }
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = os.path.join(tmpdir, "%(title).60s.%(ext)s")
+            ydl_opts = {
+                "outtmpl": output_path,
+                "format": fmt_map.get(quality, fmt_map["best"]),
+                "merge_output_format": "mp4",
+                "quiet": True, "no_warnings": True, "socket_timeout": 60,
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.extract_info(url, download=True)
+
+            files = list(Path(tmpdir).iterdir())
+            if not files:
+                raise Exception("لم يُنشأ أي ملف")
+
+            file_path = str(files[0])
+            file_size = os.path.getsize(file_path)
+            size_mb   = round(file_size / 1024 / 1024, 1)
+
+            # ── Build the result keyboard ──────────────────────────────────────
+            platform_row = [InlineKeyboardButton("📣 اختيار منصة النشر", callback_data="smart_choose_platform")]
+
+            if file_size <= TG_UPLOAD_LIMIT:
+                # Upload to Telegram
+                await query.message.reply_text("📤 جاري الإرسال...")
+                with open(file_path, "rb") as f:
+                    sent_msg = await query.message.reply_video(
+                        video=f,
+                        caption=f"📥 <b>{title}</b>\n\n📦 الحجم: {size_mb} MB",
+                        parse_mode="HTML",
+                        supports_streaming=True,
+                    )
+                await query.message.reply_text(
+                    "✅ <b>تم التحميل!</b>\n\n"
+                    "اختر منصة النشر ليعطيك البوت نصاً وهاشتاغات جاهزة 👇",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([platform_row]),
+                )
+            else:
+                # File too big → get direct URL
+                try:
+                    with yt_dlp.YoutubeDL({"quiet": True, "skip_download": True}) as ydl2:
+                        raw_info = ydl2.extract_info(url, download=False)
+                        direct_url = raw_info.get("url") or url
+                    dl_btn = InlineKeyboardButton(f"⬇️ تنزيل الفيديو ({size_mb} MB)", url=direct_url)
+                except Exception:
+                    dl_btn = InlineKeyboardButton("🔗 فتح الرابط الأصلي", url=url)
+
+                await query.message.reply_text(
+                    f"📦 <b>{title}</b>\n\n"
+                    f"⚠️ الحجم ({size_mb} MB) كبير جداً للإرسال عبر تيليغرام.\n"
+                    "اضغط الزر أدناه للتنزيل المباشر 👇\n\n"
+                    "ثم اختر منصة النشر للحصول على النص والهاشتاغات:",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[dl_btn], platform_row]),
+                )
+
+        # Mark that we have info ready for platform step
+        context.user_data["smart_dl_ready"] = True
+
+    except yt_dlp.utils.DownloadError as e:
+        logger.error(f"Smart DL download error: {e}")
+        await query.message.reply_text(
+            "❌ فشل التحميل. تأكد أن المحتوى متاح للعموم وحاول مرة أخرى.",
+            reply_markup=main_keyboard(),
+        )
+    except Exception as e:
+        logger.error(f"Smart DL unexpected: {e}")
+        await query.message.reply_text(
+            f"❌ حدث خطأ: {str(e)[:200]}",
+            reply_markup=main_keyboard(),
+        )
+
+
+# ── Caption & Hashtag Generator ──────────────────────────────────────────────
+
+def _template_caption(platform: str, title: str, desc: str, tags: list, channel: str) -> str:
+    """Generate a platform-specific caption using video metadata."""
+    # Clean & build hashtags
+    raw_tags = [t for t in (tags or []) if isinstance(t, str) and len(t) > 1]
+    ht = ["#" + re.sub(r'[^\w\u0600-\u06FF]', '', t.replace(' ', '_')) for t in raw_tags[:18]]
+    ht = [h for h in ht if len(h) > 2]
+
+    platform_ht = {
+        "instagram": ["#instagram", "#reels", "#اكسبلور", "#trending", "#viral", "#انستقرام"],
+        "tiktok":    ["#tiktok", "#fyp", "#foryoupage", "#viral", "#trending", "#تيك_توك", "#اكسبلور"],
+        "youtube":   ["#youtube", "#يوتيوب", "#shorts", "#viral"],
+    }
+    extra = [h for h in platform_ht.get(platform, []) if h not in ht]
+    all_ht = (ht + extra)[:20]
+    tags_block = " ".join(all_ht)
+
+    short_desc = ""
+    if desc:
+        clean = re.sub(r'\n+', ' ', desc).strip()
+        short_desc = clean[:200] + ("..." if len(clean) > 200 else "")
+
+    src_line = f"📺 المصدر: {channel}" if channel else ""
+
+    if platform == "instagram":
+        caption = (
+            f"🎬 {title}\n\n"
+            f"{short_desc + chr(10) + chr(10) if short_desc else ''}"
+            f"{src_line + chr(10) + chr(10) if src_line else ''}"
+            f"👇 شاهد الفيديو كاملاً في البروفايل\n\n"
+            f"{'━' * 20}\n"
+            f"{tags_block}"
+        )
+    elif platform == "tiktok":
+        caption = (
+            f"{title} ✨\n\n"
+            f"{src_line + chr(10) if src_line else ''}"
+            f"{tags_block}"
+        )
+    elif platform == "youtube":
+        caption = (
+            f"📹 {title}\n\n"
+            f"{short_desc + chr(10) + chr(10) if short_desc else ''}"
+            f"{src_line + chr(10) if src_line else ''}"
+            f"\n🔖 كلمات مفتاحية:\n{tags_block}"
+        )
+    else:
+        caption = f"{title}\n\n{tags_block}"
+
+    return caption
+
+
+async def _ai_caption(platform: str, title: str, desc: str, tags: list, channel: str) -> str:
+    """Generate AI caption via Gemini API (falls back to template if no key)."""
+    if not GEMINI_KEY:
+        return _template_caption(platform, title, desc, tags, channel)
+
+    platform_names = {
+        "instagram": "إنستغرام (Reels / Posts)",
+        "tiktok":    "تيك توك (TikTok)",
+        "youtube":   "يوتيوب (YouTube Shorts / Videos)",
+    }
+    tags_str = ", ".join(tags[:20]) if tags else "غير متوفرة"
+    prompt = (
+        f"أنت خبير تسويق رقمي عربي. اكتب محتوى جاهزاً للنشر على {platform_names.get(platform, platform)} "
+        f"للفيديو التالي:\n\n"
+        f"العنوان: {title}\n"
+        f"القناة/المصدر: {channel or 'غير محدد'}\n"
+        f"الوصف: {desc[:600] if desc else 'غير متوفر'}\n"
+        f"الكلمات المفتاحية: {tags_str}\n\n"
+        f"اكتب:\n"
+        f"1. نص منشور جذاب باللغة العربية (3-5 جمل) يشجع على المشاهدة، مع ايموجيات مناسبة\n"
+        f"2. 15-20 هاشتاغ مناسب للمنصة (مزيج عربي وإنجليزي)\n\n"
+        f"الرد يكون جاهزاً للنسخ والنشر مباشرةً بدون أي شرح إضافي."
+    )
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}",
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"temperature": 0.8, "maxOutputTokens": 1200},
+                },
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                data = await resp.json()
+                return data["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception as e:
+        logger.warning(f"Gemini AI failed ({e}), using template")
+        return _template_caption(platform, title, desc, tags, channel)
+
+
+async def smart_platform_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 3: platform chosen → generate & send caption + hashtags."""
+    query = update.callback_query
+    await query.answer()
+
+    info = context.user_data.get("smart_dl_info")
+    if not info:
+        await query.answer("⚠️ انتهت الجلسة، ابدأ من جديد.", show_alert=True)
+        return
+
+    platform_map = {
+        "sdp_instagram": ("instagram", "📸 إنستغرام"),
+        "sdp_tiktok":    ("tiktok",    "🎵 تيك توك"),
+        "sdp_youtube":   ("youtube",   "▶️ يوتيوب"),
+    }
+    platform_key, platform_label = platform_map.get(query.data, ("instagram", "إنستغرام"))
+
+    await query.message.reply_text(f"🧠 جاري توليد المحتوى لـ {platform_label}...")
+
+    caption = await _ai_caption(
+        platform  = platform_key,
+        title     = info.get("title", ""),
+        desc      = info.get("desc", ""),
+        tags      = info.get("tags", []),
+        channel   = info.get("channel", ""),
+    )
+
+    source_note = "✨ (مُولَّد بالذكاء الاصطناعي)" if GEMINI_KEY else "📝 (قالب جاهز)"
+    header = (
+        f"{platform_label} — <b>نص جاهز للنشر</b> {source_note}\n"
+        f"{'━' * 30}\n\n"
+    )
+
+    # Send in a copyable code block for easy copying
+    await query.message.reply_text(
+        header,
+        parse_mode="HTML",
+    )
+    await query.message.reply_text(
+        caption,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 تغيير المنصة", callback_data="smart_choose_platform")],
+            [InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="back_main")],
+        ]),
+    )
+
+
+async def smart_choose_platform_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show platform selection menu."""
+    query = update.callback_query
+    await query.answer()
+
+    info = context.user_data.get("smart_dl_info")
+    if not info:
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text(
+            "⚠️ انتهت الجلسة. ابدأ من جديد.",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    await query.message.reply_text(
+        f"📣 <b>اختر المنصة التي ستنشر عليها الفيديو</b>\n\n"
+        f"📹 <i>{info.get('title', '')[:80]}</i>\n\n"
+        "سيُولَّد لك نص جذاب وهاشتاغات مناسبة للمنصة المختارة 👇",
+        parse_mode="HTML",
+        reply_markup=smart_platform_keyboard(),
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ░░  SECTION G — CHANNEL POST ID LOGGER  ░░
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -969,8 +1350,12 @@ def main():
     app.add_handler(CallbackQueryHandler(back_main_callback,          pattern="^back_main$"))
     app.add_handler(CallbackQueryHandler(check_subscription_callback, pattern="^check_sub$"))
     app.add_handler(CallbackQueryHandler(ig_check_callback,           pattern="^ig_check$"))
-    app.add_handler(CallbackQueryHandler(voice_clone_callback,        pattern="^voice_clone$"))
-    app.add_handler(CallbackQueryHandler(vc_delete_callback,          pattern="^vc_delete$"))
+    app.add_handler(CallbackQueryHandler(voice_clone_callback,          pattern="^voice_clone$"))
+    app.add_handler(CallbackQueryHandler(vc_delete_callback,            pattern="^vc_delete$"))
+    app.add_handler(CallbackQueryHandler(smart_download_callback,       pattern="^smart_download$"))
+    app.add_handler(CallbackQueryHandler(smart_quality_callback,        pattern="^sdq_(360|720|1080|best)$"))
+    app.add_handler(CallbackQueryHandler(smart_choose_platform_callback,pattern="^smart_choose_platform$"))
+    app.add_handler(CallbackQueryHandler(smart_platform_callback,       pattern="^sdp_(instagram|tiktok|youtube)$"))
 
     # ── Media messages (for voice cloning) ───────────────────────────────────
     media_filter = (
